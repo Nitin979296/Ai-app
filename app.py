@@ -2,22 +2,63 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import requests
-from datetime import datetime
-import plotly.express as px
 import time
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="AI Trading Bot", layout="wide", page_icon="📈")
-st.title("📈 Mera Pehla AI Trading Dashboard")
-st.write("**Real-time Nifty + Option Chain + AI Signals** 🔥")
+# --- PAGE SETUP & THEME ---
+st.set_page_config(page_title="Pro AI Trader", layout="wide", initial_sidebar_state="expanded")
+
+# Auto-refresh har 30 second mein (Taki aapko refresh na karna pade)
+count = st_autorefresh(interval=30000, limit=100, key="data_refresh")
+
+st.title("🚀 Pro AI Trading Terminal")
+st.markdown("Live Option Chain | AI Signals | BankNifty | Auto-Refresh 30s")
 st.divider()
 
-# ================== CACHING (Sabse Important) ==================
-@st.cache_data(ttl=45)  # 45 seconds mein refresh
-def get_pcr():
+# --- SIDEBAR (Settings & Telegram) ---
+st.sidebar.header("⚙️ Settings")
+selected_index = st.sidebar.selectbox("Market Select Karein:", ["NIFTY", "BANKNIFTY", "FINNIFTY"])
+
+st.sidebar.subheader("📱 Telegram Alerts")
+telegram_token = st.sidebar.text_input("Bot Token (Optional)", type="password")
+telegram_chatid = st.sidebar.text_input("Chat ID (Optional)", type="password")
+
+# Index Ticker Mapping
+tickers = {
+    "NIFTY": {"yf": "^NSEI", "nse": "NIFTY"},
+    "BANKNIFTY": {"yf": "^NSEBANK", "nse": "BANKNIFTY"},
+    "FINNIFTY": {"yf": "NIFTY_FIN_SERVICE.NS", "nse": "FINNIFTY"}
+}
+
+# --- FUNCTIONS WITH CACHING (Jisse NSE block na kare) ---
+@st.cache_data(ttl=30) # 30 second tak data save rakhega, baar-baar download nahi karega
+def fetch_market_data(ticker):
     try:
-        url = 'https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY'
+        # Pichle 5 din ka data lenge taki SMA aur RSI sahi se ban sake
+        data = yf.Ticker(ticker).history(period="5d", interval="15m")
+        if data.empty:
+            return None
+        
+        # Indicators: SMA (10) aur simple RSI (14)
+        data['SMA_10'] = data['Close'].rolling(window=10).mean()
+        
+        # RSI Calculation
+        delta = data['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        data['RSI_14'] = 100 - (100 / (1 + rs))
+        
+        return data
+    except Exception as e:
+        return None
+
+@st.cache_data(ttl=60)
+def fetch_option_chain(symbol):
+    try:
+        url = f'https://www.nseindia.com/api/option-chain-indices?symbol={symbol}'
         headers = {
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36',
             'accept-encoding': 'gzip, deflate, br',
             'accept-language': 'en-US,en;q=0.9'
         }
@@ -27,93 +68,107 @@ def get_pcr():
         
         if response.status_code == 200:
             data = response.json()
-            tot_ce = data['filtered']['CE']['totOI']
-            tot_pe = data['filtered']['PE']['totOI']
-            pcr_value = round(tot_pe / tot_ce, 2) if tot_ce > 0 else 0
-            
-            trend = "Tezi (Bullish) 🟢" if pcr_value > 1.0 else "Mandi (Bearish) 🔴"
-            return pcr_value, trend, "✅ Live"
+            return data
         else:
-            return None, "NSE Blocked", "❌"
+            return None
     except:
-        return None, "Data Delay", "⚠️"
+        return None
 
-@st.cache_data(ttl=30)
-def get_nifty_data():
-    try:
-        nifty = yf.Ticker("^NSEI")
-        # 2d liya taaki market closed hone par bhi pichla data mile
-        live_data = nifty.history(period="2d", interval="15m")
-        
-        if live_data.empty:
-            raise ValueError("No data")
-            
-        live_price = round(live_data['Close'].iloc[-1], 2)
-        open_price = round(live_data['Open'].iloc[0], 2) if len(live_data) > 1 else live_price
-        point_change = round(live_price - open_price, 2)
-        
-        # Technical Indicators
-        live_data['SMA_10'] = live_data['Close'].rolling(window=10).mean()
-        live_data['SMA_20'] = live_data['Close'].rolling(window=20).mean()
-        current_sma10 = live_data['SMA_10'].iloc[-1]
-        
-        market_trend = "BULLISH 🟢" if live_price > current_sma10 else "BEARISH 🔴"
-        
-        return live_data, live_price, point_change, market_trend, "✅ Live"
-    except:
-        return None, None, None, "ERROR", "❌"
+def send_telegram_msg(msg):
+    if telegram_token and telegram_chatid:
+        url = f"https://api.telegram.org/bot{telegram_token}/sendMessage?chat_id={telegram_chatid}&text={msg}"
+        requests.get(url)
 
-# Data fetch
-live_data, live_price, point_change, market_trend, price_status = get_nifty_data()
-pcr_val, pcr_trend, pcr_status = get_pcr()
+# --- FETCHING DATA ---
+yf_ticker = tickers[selected_index]["yf"]
+nse_ticker = tickers[selected_index]["nse"]
 
-# ================== DASHBOARD ==================
-col1, col2, col3, col4 = st.columns(4)
+live_data = fetch_market_data(yf_ticker)
+oc_data = fetch_option_chain(nse_ticker)
 
-col1.metric("NIFTY 50 (Live)", 
-            f"₹ {live_price}" if live_price else "Error", 
-            f"{point_change} pts" if point_change else "0")
-
-col2.metric("Chart Trend (SMA-10)", 
-            market_trend, 
-            delta="15m Candle", delta_color="off")
-
-col3.metric("Put-Call Ratio (PCR)", 
-            f"{pcr_val:.2f}" if pcr_val is not None else "Error", 
-            pcr_trend, delta_color="off")
-
-col4.metric("Market Status", price_status, pcr_status)
-
-# ================== AI SIGNAL ==================
-st.subheader("🤖 AI Trading Signal")
-if live_price and pcr_val is not None:
-    if market_trend == "BULLISH 🟢" and pcr_val > 1.1:
-        signal = "🟢 **STRONG BUY** - Bullish + High PCR"
-        color = "green"
-    elif market_trend == "BEARISH 🔴" and pcr_val < 0.9:
-        signal = "🔴 **STRONG SELL** - Bearish + Low PCR"
-        color = "red"
-    else:
-        signal = "🟡 **NEUTRAL** - Wait for confirmation"
-        color = "orange"
-    st.markdown(f"<h3 style='color:{color};'>{signal}</h3>", unsafe_allow_html=True)
-
-# ================== INTERACTIVE CHART ==================
-st.subheader("📊 Nifty Intraday Trend (Live Chart)")
-if live_data is not None:
-    fig = px.line(live_data, y='Close', 
-                  title=f"Nifty 50 - Last Updated: {datetime.now().strftime('%H:%M:%S')}",
-                  template="plotly_dark",
-                  markers=False)
-    fig.add_hline(y=live_data['SMA_10'].iloc[-1], line_dash="dash", line_color="yellow", annotation_text="SMA 10")
-    fig.update_layout(height=500)
-    st.plotly_chart(fig, use_container_width=True)
+# --- UI LOGIC ---
+if live_data is None:
+    st.error("Market Data abhi available nahi hai (Market closed ya Yahoo Finance error).")
 else:
-    st.error("Nifty data nahi aa raha. Market band ho sakta hai.")
+    # Safe iloc (Weekend Error Fix)
+    current_price = round(live_data['Close'].iloc[-1], 2)
+    sma_10 = live_data['SMA_10'].iloc[-1]
+    rsi_14 = live_data['RSI_14'].iloc[-1]
+    
+    # Process Option Chain
+    pcr_value = 0
+    pcr_status = "N/A"
+    df_oc = pd.DataFrame()
+    
+    if oc_data and 'filtered' in oc_data:
+        tot_ce = oc_data['filtered']['CE']['totOI']
+        tot_pe = oc_data['filtered']['PE']['totOI']
+        pcr_value = round(tot_pe / tot_ce, 2) if tot_ce > 0 else 0
+        
+        # Full Option Chain Table Banana
+        records = []
+        for item in oc_data['filtered']['data']:
+            ce = item.get('CE', {})
+            pe = item.get('PE', {})
+            records.append({
+                "CE Chg OI": ce.get('changeinOpenInterest', 0),
+                "CE OI": ce.get('openInterest', 0),
+                "CE LTP": ce.get('lastPrice', 0),
+                "STRIKE": item.get('strikePrice'),
+                "PE LTP": pe.get('lastPrice', 0),
+                "PE OI": pe.get('openInterest', 0),
+                "PE Chg OI": pe.get('changeinOpenInterest', 0)
+            })
+        df_oc = pd.DataFrame(records)
+        
+        # Sirf current price ke aas-paas (ATM) ki 10 strike dikhane ke liye filter
+        df_oc = df_oc[(df_oc['STRIKE'] > current_price - 500) & (df_oc['STRIKE'] < current_price + 500)]
+    
+    # --- AI MULTI-SIGNAL ENGINE ---
+    signal = "WAIT ⏳"
+    signal_color = "warning"
+    
+    is_bullish_price = current_price > sma_10
+    is_bullish_pcr = pcr_value >= 1.0
+    
+    if is_bullish_price and is_bullish_pcr and rsi_14 < 70:
+        signal = "STRONG BUY (CE) 🟢"
+        signal_color = "success"
+    elif not is_bullish_price and pcr_value < 0.9 and rsi_14 > 30:
+        signal = "STRONG SELL (PE) 🔴"
+        signal_color = "error"
+        
+    # Send Telegram Alert (sirf jab signal badle)
+    if "last_signal" not in st.session_state:
+        st.session_state.last_signal = signal
+    elif st.session_state.last_signal != signal and signal != "WAIT ⏳":
+        send_telegram_msg(f"🚨 {selected_index} ALERT: {signal} at Price {current_price}")
+        st.session_state.last_signal = signal
 
-# ================== AUTO REFRESH BUTTON ==================
-if st.button("🔄 Manual Refresh"):
-    st.cache_data.clear()
-    st.rerun()
+    # --- TOP DASHBOARD METRICS ---
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Live Price", f"{current_price}")
+    col2.metric("Trend (SMA 10)", "BULLISH ⬆️" if is_bullish_price else "BEARISH ⬇️")
+    col3.metric("RSI (Momentum)", f"{rsi_14:.1f}")
+    col4.metric("PCR (Data)", f"{pcr_value}")
 
-st.caption("Auto-refresh every 45 seconds (caching ke wajah se fast)")
+    # --- MASTER AI SIGNAL ---
+    st.markdown(f"### AI Master Signal: ")
+    if signal_color == "success":
+        st.success(f"**{signal}** - Price upar hai, PCR positive hai, overbought nahi hai.")
+    elif signal_color == "error":
+        st.error(f"**{signal}** - Price niche hai, PCR negative hai, oversold nahi hai.")
+    else:
+        st.warning(f"**{signal}** - Market sideways hai. Faltu trade mat lena!")
+
+    # --- TABS FOR CHARTS AND DATA ---
+    tab1, tab2 = st.tabs(["📊 Live Chart", "📈 Full Option Chain"])
+    
+    with tab1:
+        st.line_chart(live_data['Close'])
+        
+    with tab2:
+        if not df_oc.empty:
+            st.dataframe(df_oc.set_index('STRIKE').style.background_gradient(cmap='Blues'), use_container_width=True)
+        else:
+            st.error("NSE Server ne block kar diya hai. Cloud par NSE kabhi-kabhi data nahi deta. Local laptop par test karein.")
