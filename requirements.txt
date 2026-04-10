@@ -2,3 +2,6 @@ streamlit
 pandas
 yfinance
 requests
+from datetime import datetime
+import plotly.express as px
+import time
